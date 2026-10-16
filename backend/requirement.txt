@@ -1,0 +1,9 @@
+
+fastapi
+uvicorn[standard]
+python-multipart
+pypdf
+python-dotenv
+google-genai
+python-docx
+reportlab
