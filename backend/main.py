@@ -18,6 +18,7 @@ from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, KeepTogether, HRFlowable, Table, TableStyle
 from google import genai
 from google.genai import types
+from groq import Groq
 from pypdf import PdfReader
 
 # Load environment variables from backend/.env
@@ -27,7 +28,7 @@ load_dotenv(BASE_DIR / ".env")
 app = FastAPI(
     title="AI Resume Analyzer",
     description="Resume analysis, ATS matching, and resume optimization",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 app.add_middleware(
@@ -42,9 +43,18 @@ app.add_middleware(
 )
 
 API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-# Override this in backend/.env if this model is unavailable to your API key.
+# Keep the primary provider configurable; change this value in backend/.env if needed.
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 client = genai.Client(api_key=API_KEY) if API_KEY else None
+
+# Backup provider: Groq. Create a key at https://console.groq.com/.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+groq_client = (
+    Groq(api_key=GROQ_API_KEY, timeout=60.0, max_retries=1)
+    if GROQ_API_KEY
+    else None
+)
 
 MAX_PDF_SIZE = 5 * 1024 * 1024
 MAX_RESUME_CHARS = 30000
@@ -52,143 +62,155 @@ MAX_JOB_CHARS = 15000
 MAX_OPTIMIZED_RESUME_CHARS = 50000
 
 
-def require_client():
-    if not API_KEY or client is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Gemini API key is missing. Add GEMINI_API_KEY to "
-                "backend/.env, save the file, and restart the backend."
-            ),
-        )
+def _validate_ai_response(response_text: str, json_mode: bool) -> str:
+    """Reject empty output and malformed JSON so the backup can be tried."""
+    if not response_text or not response_text.strip():
+        raise ValueError("AI provider returned an empty response")
+
+    cleaned = response_text.strip()
+    if json_mode:
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict):
+            raise ValueError("AI provider returned JSON that was not an object")
+
+    return response_text.strip()
 
 
 def call_gemini(prompt: str, json_mode: bool = False) -> str:
-    """Call Gemini with retries for temporary server errors."""
-    require_client()
-    started_at = time.perf_counter()
+    """Call Gemini, retrying temporary server errors before returning failure."""
+    if not API_KEY or client is None:
+        raise RuntimeError("Gemini is not configured")
 
+    started_at = time.perf_counter()
     config = None
     if json_mode:
-        # A bounded response and JSON mode reduce oversized, hard-to-parse output.
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
             max_output_tokens=4096,
             temperature=0.2,
         )
 
-    response = None
     max_attempts = 4
-
-    try:
-        for attempt in range(max_attempts):
-            try:
-                response = client.models.generate_content(
-                    model=MODEL_NAME,
-                    contents=prompt,
-                    config=config,
+    for attempt in range(max_attempts):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=config,
+            )
+            response_text = getattr(response, "text", None)
+            response_text = _validate_ai_response(response_text or "", json_mode)
+            print(
+                f"Gemini request completed in {time.perf_counter() - started_at:.1f}s "
+                f"(model={MODEL_NAME})."
+            )
+            return response_text
+        except Exception as exc:
+            lowered = str(exc).lower()
+            retryable = any(term in lowered for term in (
+                "503", "unavailable", "high demand", "overloaded",
+                "500", "502", "504", "internal server error",
+            ))
+            if retryable and attempt < max_attempts - 1:
+                wait_seconds = 2 ** (attempt + 1)
+                print(
+                    f"Gemini temporary error on attempt {attempt + 1}/{max_attempts}; "
+                    f"retrying in {wait_seconds} seconds."
                 )
-                break
-            except Exception as exc:
-                error_text = str(exc)
-                lowered = error_text.lower()
-                retryable = any(term in lowered for term in (
-                    "503", "unavailable", "high demand", "overloaded",
-                    "500", "502", "504", "internal server error",
-                ))
+                time.sleep(wait_seconds)
+                continue
+            raise
 
-                if retryable and attempt < max_attempts - 1:
-                    wait_seconds = 2 ** (attempt + 1)
-                    print(
-                        f"Gemini temporary error on attempt "
-                        f"{attempt + 1}/{max_attempts}. "
-                        f"Retrying in {wait_seconds} seconds."
-                    )
-                    time.sleep(wait_seconds)
-                    continue
-                raise
+    raise RuntimeError("Gemini request failed after retries")
 
-        print(
-            f"Gemini request completed in "
-            f"{time.perf_counter() - started_at:.1f}s "
-            f"(model={MODEL_NAME})."
-        )
-        response_text = getattr(response, "text", None)
 
-        if not response_text or not response_text.strip():
-            print("Gemini API returned an empty response.")
+def call_groq(prompt: str, json_mode: bool = False) -> str:
+    """Call Groq as the backup provider."""
+    if not GROQ_API_KEY or groq_client is None:
+        raise RuntimeError("Groq backup is not configured")
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a careful resume analysis and resume optimization assistant. "
+                "Never invent the candidate's skills, qualifications, employment, "
+                "dates, achievements, or metrics. Follow the user's output format."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    request_options = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "max_completion_tokens": 4096,
+    }
+    if json_mode:
+        # GPT-OSS 20B supports JSON Object Mode on Groq.
+        request_options["response_format"] = {"type": "json_object"}
+
+    started_at = time.perf_counter()
+    response = groq_client.chat.completions.create(**request_options)
+    response_text = response.choices[0].message.content or ""
+    response_text = _validate_ai_response(response_text, json_mode)
+    print(
+        f"Groq fallback completed in {time.perf_counter() - started_at:.1f}s "
+        f"(model={GROQ_MODEL})."
+    )
+    return response_text
+
+
+def call_ai(prompt: str, json_mode: bool = False) -> tuple[str, str, str]:
+    """Try Gemini first, then automatically fall back to Groq on any failure."""
+    gemini_error = None
+
+    if client is not None:
+        try:
+            return call_gemini(prompt, json_mode), "Gemini", MODEL_NAME
+        except Exception as exc:
+            gemini_error = exc
+            print(
+                f"Gemini failed ({type(exc).__name__}); "
+                "trying the configured Groq backup if available."
+            )
+    else:
+        gemini_error = RuntimeError("Gemini API key is not configured")
+        print("Gemini is not configured; checking the Groq backup.")
+
+    if groq_client is not None:
+        try:
+            return call_groq(prompt, json_mode), "Groq", GROQ_MODEL
+        except Exception as groq_error:
+            print(f"Groq fallback failed ({type(groq_error).__name__}).")
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    "Gemini returned an empty response. Check the selected "
-                    "model and retry."
+                    "Both AI providers failed to return a result. Please try again shortly. "
+                    "If the problem continues, check the backend logs and both providers' "
+                    "API keys, model access, and usage limits."
                 ),
-            )
+            ) from None
 
-        return response_text.strip()
+    if not client and not groq_client:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No AI provider is configured. Add GEMINI_API_KEY and/or GROQ_API_KEY "
+                "to backend/.env, then restart the backend."
+            ),
+        ) from None
 
-    except HTTPException:
-        raise
-    except Exception as exc:
-        error_type = type(exc).__name__
-        error_text = str(exc)
-        print(f"\nGemini API error type: {error_type}")
-        print(f"Gemini API error details: {error_text}\n")
-
-        lowered = error_text.lower()
-        if any(term in lowered for term in (
-            "api_key_invalid", "invalid api key", "api key not valid",
-            "unauthorized", "permission_denied", "permission denied",
-            "401", "403",
-        )):
-            detail = (
-                "Gemini rejected the API key or access. Check "
-                "GEMINI_API_KEY in backend/.env and verify that your key "
-                "can access the configured model. See the backend terminal."
-            )
-        elif any(term in lowered for term in (
-            "quota", "resource_exhausted", "rate limit", "429",
-            "billing", "limit exceeded",
-        )):
-            detail = (
-                "Gemini usage quota or rate limit was reached. Check your "
-                "Google AI Studio usage limits and retry when available."
-            )
-        elif any(term in lowered for term in (
-            "not found", "model not found", "unsupported model",
-            "404", "not supported for generatecontent",
-        )):
-            detail = (
-                f"Gemini model '{MODEL_NAME}' is not available to this API "
-                "key or is not a valid model name. Set GEMINI_MODEL in "
-                "backend/.env to a model listed for your key. See the "
-                "backend terminal."
-            )
-        elif any(term in lowered for term in (
-            "503", "unavailable", "high demand", "overloaded",
-            "500", "502", "504", "internal server error",
-        )):
-            detail = (
-                "Gemini is temporarily unavailable or overloaded. "
-                "Automatic retries were unsuccessful. Please wait and "
-                "try again later."
-            )
-        elif any(term in lowered for term in (
-            "timeout", "timed out", "connection", "network", "dns",
-        )):
-            detail = (
-                "Could not connect to Gemini. Check your internet connection "
-                "and retry. See the backend terminal for details."
-            )
-        else:
-            detail = (
-                "Gemini API request failed. Check the backend terminal for "
-                "the exact error; common causes include API-key access, "
-                "model availability, usage limits, or connectivity."
-            )
-
-        raise HTTPException(status_code=502, detail=detail) from None
-
+    # Gemini was configured but failed, and there is no backup key configured.
+    print(f"Gemini failed and Groq is not configured ({type(gemini_error).__name__}).")
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "Gemini could not complete this request and the Groq backup is not configured. "
+            "Add GROQ_API_KEY to backend/.env to enable automatic fallback, then restart."
+        ),
+    ) from None
 
 def parse_json_response(text: str) -> dict:
     """Parse a JSON response, including one wrapped in Markdown fences."""
@@ -202,7 +224,7 @@ def parse_json_response(text: str) -> dict:
             raise ValueError("Expected a JSON object.")
         return result
     except (json.JSONDecodeError, ValueError):
-        print("Gemini returned an invalid JSON object.")
+        print("AI provider returned an invalid JSON object.")
         raise HTTPException(
             status_code=502,
             detail=(
@@ -229,7 +251,7 @@ def home():
     return {
         "message": "AI Resume Analyzer backend is running!",
         "status": "success",
-        "version": "2.1.0",
+        "version": "2.2.0",
     }
 
 
@@ -237,8 +259,10 @@ def home():
 def health_check():
     return {
         "status": "healthy",
-        "ai_configured": bool(API_KEY and client),
-        "model": MODEL_NAME,
+        "ai_configured": bool(client or groq_client),
+        "primary_provider": "Gemini" if client else None,
+        "backup_provider_configured": bool(groq_client),
+        "model": MODEL_NAME if client else (GROQ_MODEL if groq_client else None),
     }
 
 
@@ -323,11 +347,12 @@ RESUME:
 JOB DESCRIPTION:
 {job_description}
 """
-    analysis = call_gemini(prompt)
+    analysis, provider_used, model_used = call_ai(prompt)
     return {
         "status": "success",
         "analysis": analysis,
-        "model": MODEL_NAME,
+        "provider": provider_used,
+        "model": model_used,
     }
 
 
@@ -371,7 +396,7 @@ TARGET JOB DESCRIPTION:
 {job_description}
 """
     # Run the blocking SDK request in a worker thread so other API requests remain responsive.
-    raw_response = await asyncio.to_thread(call_gemini, prompt, True)
+    raw_response, provider_used, model_used = await asyncio.to_thread(call_ai, prompt, True)
     result = parse_json_response(raw_response)
 
     score = result.get("ats_match_score")
@@ -395,7 +420,8 @@ TARGET JOB DESCRIPTION:
 
     return {
         "status": "success",
-        "model": MODEL_NAME,
+        "provider": provider_used,
+        "model": model_used,
         **result,
     }
 

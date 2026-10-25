@@ -1,9 +1,9 @@
-
 fastapi
 uvicorn[standard]
 python-multipart
 pypdf
 python-dotenv
 google-genai
+groq
 python-docx
 reportlab
